@@ -1,6 +1,6 @@
 let DoH = "dns.google";
-const jsonDoH = `https://${DoH}/resolve`;
-const dnsDoH = `https://${DoH}/dns-query`;
+let jsonDoH = `https://${DoH}/resolve`;
+let dnsDoH = `https://${DoH}/dns-query`;
 let DoH路径 = 'dns-query';
 export default {
   async fetch(request, env) {
@@ -10,6 +10,9 @@ export default {
       if (match) {
         DoH = match[1];
       }
+	   // 重新生成
+	  jsonDoH = `https://${DoH}/resolve`;
+	  dnsDoH = `https://${DoH}/dns-query`;
     }
     DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
     if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
