@@ -1,28 +1,23 @@
-let DoH = "dns.google";
-let jsonDoH = `https://${DoH}/resolve`;
-let dnsDoH = `https://${DoH}/dns-query`;
+let DoH = "cloudflare-dns.com";
+const jsonDoH = `https://${DoH}/resolve`;
+const dnsDoH = `https://${DoH}/dns-query`;
 let DoH路径 = 'dns-query';
-
 export default {
   async fetch(request, env) {
-
-    // ===== 初始化配置 =====
     if (env.DOH) {
       DoH = env.DOH;
       const match = DoH.match(/:\/\/([^\/]+)/);
-      if (match) DoH = match[1];
-
-      jsonDoH = `https://${DoH}/resolve`;
-      dnsDoH = `https://${DoH}/dns-query`;
+      if (match) {
+        DoH = match[1];
+      }
     }
-
-    DoH路径 = env.PATH || env.TOKEN || DoH路径;
+    DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
     if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
-
     const url = new URL(request.url);
     const path = url.pathname;
+    const hostname = url.hostname;
 
-    // ===== CORS =====
+    // 处理 OPTIONS 预检请求
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -34,222 +29,83 @@ export default {
       });
     }
 
-    // =========================
-    // 1. 本地 RFC8484 DoH 入口
-    // =========================
+    // 如果请求路径，则作为 DoH 服务器处理
     if (path === `/${DoH路径}`) {
       return await DOHRequest(request);
     }
 
-    // =========================
-    // 2. IP 查询
-    // =========================
+    // 添加IP地理位置信息查询代理
     if (path === '/ip-info') {
-      const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
+      if (env.TOKEN) {
+        const token = url.searchParams.get('token');
+        if (token != env.TOKEN) {
+          return new Response(JSON.stringify({ 
+            status: "error",
+            message: "Token不正确",
+            code: "AUTH_FAILED",
+            timestamp: new Date().toISOString()
+          }, null, 4), {
+            status: 403,
+            headers: {
+              "content-type": "application/json; charset=UTF-8",
+              'Access-Control-Allow-Origin': '*'
+            }
+          });
+        }
+      }
 
+      const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
       if (!ip) {
-        return jsonError("IP参数未提供", 400);
+        return new Response(JSON.stringify({ 
+          status: "error",
+          message: "IP参数未提供",
+          code: "MISSING_PARAMETER",
+          timestamp: new Date().toISOString()
+        }, null, 4), {
+          status: 400,
+          headers: {
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
       }
 
       try {
-        const resp = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-        const data = await resp.json();
+        // 使用Worker代理请求HTTP的IP API
+        const response = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
+
+        if (!response.ok) {
+          throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // 添加时间戳到成功的响应数据中
         data.timestamp = new Date().toISOString();
 
-        return jsonResponse(data);
-      } catch (e) {
-        return jsonError(e.message, 500);
-      }
-    }
-
-    // =========================
-    // 3. DNS JSON 查询（/resolve）
-    // =========================
-    if (url.searchParams.has("doh")) {
-      const domain = url.searchParams.get("domain") || "google.com";
-      const type = url.searchParams.get("type") || "all";
-
-      if (type === "all") {
-        const [a, aaaa, ns] = await Promise.all([
-          queryDns(jsonDoH, domain, "A"),
-          queryDns(jsonDoH, domain, "AAAA"),
-          queryDns(jsonDoH, domain, "NS")
-        ]);
-
-        return jsonResponse(combine(a, aaaa, ns));
-      }
-
-      const result = await queryDns(jsonDoH, domain, type);
-      return jsonResponse(result);
-    }
-
-    // =========================
-    // 4. 默认页面
-    // =========================
-    return HTML();
-  }
-};
-
-// =====================================================
-// DNS JSON 查询（稳定版）
-// =====================================================
-async function queryDns(base, domain, type) {
-  const url = new URL(base);
-  url.searchParams.set("name", domain);
-  url.searchParams.set("type", type);
-
-  const resp = await fetch(url.toString(), {
-    headers: {
-      'Accept': 'application/dns-json'
-    }
-  });
-
-  if (!resp.ok) {
-    throw new Error(await resp.text());
-  }
-
-  const data = await resp.json();
-
-  // 修复 Google Question 可能是 object
-  if (data.Question && !Array.isArray(data.Question)) {
-    data.Question = [data.Question];
-  }
-
-  return data;
-}
-
-// =====================================================
-// 🔥 RFC8484 DoH（核心）
-// =====================================================
-async function DOHRequest(request) {
-  const url = new URL(request.url);
-
-  try {
-
-    // ================= GET JSON MODE =================
-    if (request.method === 'GET' && url.searchParams.has('name')) {
-      const name = url.searchParams.get('name');
-      const type = url.searchParams.get('type') || 'A';
-
-      const resp = await fetch(
-        `${jsonDoH}?name=${name}&type=${type}`,
-        {
+        // 返回数据给客户端，并添加CORS头
+        return new Response(JSON.stringify(data, null, 4), {
           headers: {
-            'Accept': 'application/dns-json'
+            "content-type": "application/json; charset=UTF-8",
+            'Access-Control-Allow-Origin': '*'
           }
-        }
-      );
+        });
 
-      return new Response(await resp.text(), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    // ================= RFC8484 GET =================
-    if (request.method === 'GET' && url.searchParams.has('dns')) {
-      const resp = await fetch(dnsDoH + url.search, {
-        headers: {
-          'Accept': 'application/dns-message'
-        }
-      });
-
-      return new Response(resp.body, {
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    // ================= RFC8484 POST =================
-    if (request.method === 'POST') {
-      const resp = await fetch(dnsDoH, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Accept': 'application/dns-message'
-        },
-        body: request.body
-      });
-
-      return new Response(resp.body, {
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    return new Response("Bad Request", { status: 400 });
-
-  } catch (e) {
-    return jsonError(e.message, 500);
-  }
-}
-
-// =====================================================
-// DNS 合并结果
-// =====================================================
-function combine(a, b, c) {
-  const res = {
-    ...a,
-    Answer: [
-      ...(a.Answer || []),
-      ...(b.Answer || []),
-      ...(c.Answer || [])
-    ],
-    ipv4: { records: a.Answer || [] },
-    ipv6: { records: b.Answer || [] },
-    ns: { records: c.Answer || [] },
-    Question: []
-  };
-
-  [a, b, c].forEach(r => {
-    if (r.Question) {
-      if (Array.isArray(r.Question)) res.Question.push(...r.Question);
-      else res.Question.push(r.Question);
-    }
-  });
-
-  return res;
-}
-
-// =====================================================
-// JSON 工具
-// =====================================================
-function jsonResponse(data) {
-  return new Response(JSON.stringify(data, null, 2), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
-
-function jsonError(msg, code = 500) {
-  return new Response(JSON.stringify({
-    error: msg,
-    timestamp: new Date().toISOString()
-  }), {
-    status: code,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
-
-// =====================================================
-// HTML（你原来的 UI 可继续用）
-// =====================================================
-async function HTML() {
-  return new Response("OK - DoH Server Running", {
-    headers: { "content-type": "text/plain" }
-  });
-}          headers: {
+      } catch (error) {
+        console.error("IP查询失败:", error);
+        return new Response(JSON.stringify({
+          status: "error",
+          message: `IP查询失败: ${error.message}`,
+          code: "API_REQUEST_FAILED",
+          query: ip,
+          timestamp: new Date().toISOString(),
+          details: {
+            errorType: error.name,
+            stack: error.stack ? error.stack.split('\n')[0] : null
+          }
+        }, null, 4), {
+          status: 500,
+          headers: {
             "content-type": "application/json; charset=UTF-8",
             'Access-Control-Allow-Origin': '*'
           }
@@ -1716,255 +1572,113 @@ async function HTML() {
             }
             
             // 获取域名
-let DoH = "dns.google";
-let jsonDoH = `https://${DoH}/resolve`;
-let dnsDoH = `https://${DoH}/dns-query`;
-let DoH路径 = 'dns-query';
+            const domain = document.getElementById('domain').value;
+            if (!domain) {
+              alert('请输入需要解析的域名');
+              return;
+            }
+            
+            // 构建完整的查询URL
+            let jsonUrl = new URL(dohUrl);
+            // 使用name参数(标准DNS-JSON格式)
+            jsonUrl.searchParams.set('name', domain);
+            
+            // 在新标签页打开
+            window.open(jsonUrl.toString(), '_blank');
+          });
+        });
+  </script>
+</body>
 
-export default {
-  async fetch(request, env) {
+</html>`;
 
-    // ===== 初始化配置 =====
-    if (env.DOH) {
-      DoH = env.DOH;
-      const match = DoH.match(/:\/\/([^\/]+)/);
-      if (match) DoH = match[1];
+  return new Response(html, {
+    headers: { "content-type": "text/html;charset=UTF-8" }
+  });
+}
 
-      jsonDoH = `https://${DoH}/resolve`;
-      dnsDoH = `https://${DoH}/dns-query`;
-    }
+async function 代理URL(代理网址, 目标网址) {
+  const 网址列表 = await 整理(代理网址);
+  const 完整网址 = 网址列表[Math.floor(Math.random() * 网址列表.length)];
 
-    DoH路径 = env.PATH || env.TOKEN || DoH路径;
-    if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
+  // 解析目标 URL
+  const 解析后的网址 = new URL(完整网址);
+  console.log(解析后的网址);
+  // 提取并可能修改 URL 组件
+  const 协议 = 解析后的网址.protocol.slice(0, -1) || 'https';
+  const 主机名 = 解析后的网址.hostname;
+  let 路径名 = 解析后的网址.pathname;
+  const 查询参数 = 解析后的网址.search;
 
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    // ===== CORS =====
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400'
-        }
-      });
-    }
-
-    // =========================
-    // 1. 本地 RFC8484 DoH 入口
-    // =========================
-    if (path === `/${DoH路径}`) {
-      return await DOHRequest(request);
-    }
-
-    // =========================
-    // 2. IP 查询
-    // =========================
-    if (path === '/ip-info') {
-      const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
-
-      if (!ip) {
-        return jsonError("IP参数未提供", 400);
-      }
-
-      try {
-        const resp = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-        const data = await resp.json();
-        data.timestamp = new Date().toISOString();
-
-        return jsonResponse(data);
-      } catch (e) {
-        return jsonError(e.message, 500);
-      }
-    }
-
-    // =========================
-    // 3. DNS JSON 查询（/resolve）
-    // =========================
-    if (url.searchParams.has("doh")) {
-      const domain = url.searchParams.get("domain") || "google.com";
-      const type = url.searchParams.get("type") || "all";
-
-      if (type === "all") {
-        const [a, aaaa, ns] = await Promise.all([
-          queryDns(jsonDoH, domain, "A"),
-          queryDns(jsonDoH, domain, "AAAA"),
-          queryDns(jsonDoH, domain, "NS")
-        ]);
-
-        return jsonResponse(combine(a, aaaa, ns));
-      }
-
-      const result = await queryDns(jsonDoH, domain, type);
-      return jsonResponse(result);
-    }
-
-    // =========================
-    // 4. 默认页面
-    // =========================
-    return HTML();
+  // 处理路径名
+  if (路径名.charAt(路径名.length - 1) == '/') {
+    路径名 = 路径名.slice(0, -1);
   }
-};
+  路径名 += 目标网址.pathname;
 
-// =====================================================
-// DNS JSON 查询（稳定版）
-// =====================================================
-async function queryDns(base, domain, type) {
-  const url = new URL(base);
-  url.searchParams.set("name", domain);
-  url.searchParams.set("type", type);
+  // 构建新的 URL
+  const 新网址 = `${协议}://${主机名}${路径名}${查询参数}`;
 
-  const resp = await fetch(url.toString(), {
-    headers: {
-      'Accept': 'application/dns-json'
-    }
+  // 反向代理请求
+  const 响应 = await fetch(新网址);
+
+  // 创建新的响应
+  let 新响应 = new Response(响应.body, {
+    status: 响应.status,
+    statusText: 响应.statusText,
+    headers: 响应.headers
   });
 
-  if (!resp.ok) {
-    throw new Error(await resp.text());
-  }
+  // 添加自定义头部，包含 URL 信息
+  //新响应.headers.set('X-Proxied-By', 'Cloudflare Worker');
+  //新响应.headers.set('X-Original-URL', 完整网址);
+  新响应.headers.set('X-New-URL', 新网址);
 
-  const data = await resp.json();
-
-  // 修复 Google Question 可能是 object
-  if (data.Question && !Array.isArray(data.Question)) {
-    data.Question = [data.Question];
-  }
-
-  return data;
+  return 新响应;
 }
 
-// =====================================================
-// 🔥 RFC8484 DoH（核心）
-// =====================================================
-async function DOHRequest(request) {
-  const url = new URL(request.url);
+async function 整理(内容) {
+  // 将制表符、双引号、单引号和换行符都替换为逗号
+  // 然后将连续的多个逗号替换为单个逗号
+  var 替换后的内容 = 内容.replace(/[	|"'\r\n]+/g, ',').replace(/,+/g, ',');
 
-  try {
+  // 删除开头和结尾的逗号（如果有的话）
+  if (替换后的内容.charAt(0) == ',') 替换后的内容 = 替换后的内容.slice(1);
+  if (替换后的内容.charAt(替换后的内容.length - 1) == ',') 替换后的内容 = 替换后的内容.slice(0, 替换后的内容.length - 1);
 
-    // ================= GET JSON MODE =================
-    if (request.method === 'GET' && url.searchParams.has('name')) {
-      const name = url.searchParams.get('name');
-      const type = url.searchParams.get('type') || 'A';
+  // 使用逗号分割字符串，得到地址数组
+  const 地址数组 = 替换后的内容.split(',');
 
-      const resp = await fetch(
-        `${jsonDoH}?name=${name}&type=${type}`,
-        {
-          headers: {
-            'Accept': 'application/dns-json'
-          }
-        }
-      );
-
-      return new Response(await resp.text(), {
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    // ================= RFC8484 GET =================
-    if (request.method === 'GET' && url.searchParams.has('dns')) {
-      const resp = await fetch(dnsDoH + url.search, {
-        headers: {
-          'Accept': 'application/dns-message'
-        }
-      });
-
-      return new Response(resp.body, {
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    // ================= RFC8484 POST =================
-    if (request.method === 'POST') {
-      const resp = await fetch(dnsDoH, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Accept': 'application/dns-message'
-        },
-        body: request.body
-      });
-
-      return new Response(resp.body, {
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*'
-        }
-      });
-    }
-
-    return new Response("Bad Request", { status: 400 });
-
-  } catch (e) {
-    return jsonError(e.message, 500);
-  }
+  return 地址数组;
 }
 
-// =====================================================
-// DNS 合并结果
-// =====================================================
-function combine(a, b, c) {
-  const res = {
-    ...a,
-    Answer: [
-      ...(a.Answer || []),
-      ...(b.Answer || []),
-      ...(c.Answer || [])
-    ],
-    ipv4: { records: a.Answer || [] },
-    ipv6: { records: b.Answer || [] },
-    ns: { records: c.Answer || [] },
-    Question: []
-  };
-
-  [a, b, c].forEach(r => {
-    if (r.Question) {
-      if (Array.isArray(r.Question)) res.Question.push(...r.Question);
-      else res.Question.push(r.Question);
-    }
-  });
-
-  return res;
-}
-
-// =====================================================
-// JSON 工具
-// =====================================================
-function jsonResponse(data) {
-  return new Response(JSON.stringify(data, null, 2), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
-
-function jsonError(msg, code = 500) {
-  return new Response(JSON.stringify({
-    error: msg,
-    timestamp: new Date().toISOString()
-  }), {
-    status: code,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
-
-// =====================================================
-// HTML（你原来的 UI 可继续用）
-// =====================================================
-async function HTML() {
-  return new Response("OK - DoH Server Running", {
-    headers: { "content-type": "text/plain" }
-  });
+async function nginx() {
+  const text = `
+	<!DOCTYPE html>
+	<html>
+	<head>
+	<title>Welcome to nginx!</title>
+	<style>
+		body {
+			width: 35em;
+			margin: 0 auto;
+			font-family: Tahoma, Verdana, Arial, sans-serif;
+		}
+	</style>
+	</head>
+	<body>
+	<h1>Welcome to nginx!</h1>
+	<p>If you see this page, the nginx web server is successfully installed and
+	working. Further configuration is required.</p>
+	
+	<p>For online documentation and support please refer to
+	<a href="http://nginx.org/">nginx.org</a>.<br/>
+	Commercial support is available at
+	<a href="http://nginx.com/">nginx.com</a>.</p>
+	
+	<p><em>Thank you for using nginx.</em></p>
+	</body>
+	</html>
+	`
+  return text;
 }
